@@ -4,12 +4,14 @@ from recon.core.module import BaseModule
 from recon.mixins.resolver import ResolverMixin
 from recon.mixins.threads import ThreadingMixin
 # module specific imports
-import os
+import os, pdb
 import re
 from lxml import etree
 import os
 import sys
+import json
 from kysecc.helpers.sqlite_helpers import SQLHelper
+from kysecc.helpers.sqlite_helpers import INSTANCE_TYPE_DIALOG, INSTANCE_TYPE_MSGSERVER, INSTANCE_TYPE_BOTH
 
 class Module(BaseModule, ResolverMixin, ThreadingMixin):
 
@@ -26,7 +28,8 @@ class Module(BaseModule, ResolverMixin, ThreadingMixin):
             ('inputfile', 'no default', 'yes', 'file with the input to be imported'),
             ('inputtype', 'SYSINFO', 'yes', """One of:
 SYSINFO (output of the sysinfo sweep)
-LANDSCAPE_XML (SAPUILandscapeCentral.xml)""")
+LANDSCAPE_XML (SAPUILandscapeCentral.xml)
+SAPWNGUIXS (Output of appservers)""")
         )
         
     }
@@ -147,7 +150,7 @@ LANDSCAPE_XML (SAPUILandscapeCentral.xml)""")
 
 
     def module_run(self):
-
+ 
         filename = self.options.get ('INPUTFILE')
         if not os.path.exists (filename) or not os.path.isfile (filename):
             self.error ("File {} does not exist".format (filename))
@@ -217,10 +220,88 @@ LANDSCAPE_XML (SAPUILandscapeCentral.xml)""")
                     finally:
                         sqlh.closeconnection (b_commit)
 
-
-                        
-
             finally:
                 f.close ()
 
+        elif inputtype == 'SAPWNGUIXS':
+            f = open (filename, "r")
+            lines = f.readlines ()
+            #pdb.set_trace()
+            for line in lines:
+                try:
+                    appserverinfo = json.loads (line)
+                except json.decoder.JSONDecodeError as e:
+                    self.error ("Line " + line + " cannot be json-parsed.")
+                    continue
 
+                keyobj = appserverinfo [0]
+                #
+                # Wenn da ein Fehler ist, so steht er im ersten Array-Element
+                # des Arrays.
+                # So sieht die Zeile aus:
+                #
+                # [{ "key" : "isdascs.wdf.sap.corp:20014" },["Error: Thu Dec  5 12:52:41 2024","Description: partner 'isdascs.wdf.sap.corp:20014' not reached"," ","Release: 753","Component: NI (network interface), version 40","rc = -10","Module: D:/depot/bas/SAPGUIForJava_780_REL/bas_753_REL/src/base/ni/nixxi.cpp","Line: 3454","Detail NiPConnect2: 10.67.36.24:20014","System Call: connect","Error No: 10061","'WSAECONNREFUSED: Connection refused'"]]
+                #
+                poterrorobj = appserverinfo[1][0] 
+
+                if poterrorobj[:7] == "Error: ":  
+                    #
+                    # Und in dem zweiten Array-Element des
+                    # Arrays steht dann eine vernünftige Fehlermeldung.
+                    #
+                    self.error (appserverinfo[1][1] )
+                    continue
+
+                msg_server_host_port = keyobj ['key']
+
+                #
+                # First get SYSTEM rowid for this msg server
+                #
+                harr = msg_server_host_port.split (":")
+                host = harr [0]
+                port = int(harr [1])
+                result = self.query ("select system from INSTANCES where host in (select rowid from hosts " + 
+                                     "where (ip_address = ? or host = ?)) and port=? and (type=? or type=?)", [
+                                     host, host, port, INSTANCE_TYPE_MSGSERVER, INSTANCE_TYPE_BOTH])
+                
+                if len(result) == 0:
+                    self.error ("Cannot find entry in instances for " + msg_server_host_port)
+                    continue
+
+                system_rowid = result [0][0]
+                b_commit = True
+                sqlh = SQLHelper (self)
+                sqlh.openconnection ()
+
+                # For each entry we have
+                # an appserver
+                for appserver in appserverinfo [1]:
+                    p = re.compile ("([^ ]*)[ ]*([^ ]*)[ ]*([^ ]*)[ ]*([^ ]*).*")
+                    m = p.match (appserver)
+                    if m is None:
+                        self.error ("Entry " + appserver + " cannot be parsed")
+                        continue
+
+                    as_type = m.group (1)
+                    instance_name = m.group (2) # has the form 
+                    host = m.group (3)
+                    port = int(m.group (4))
+
+                    #
+                    # 
+                    #
+                    p = re.compile ("[1-9][0-9]{0,2}\.[1-9][0-9]{0,2}\.[1-9][0-9]{0,2}\.[1-9][0-9]{0,2}")
+                    m = p.match (host)
+                    is_ip = m is not None
+
+                    if is_ip:
+                        host_rowid = sqlh.insert_or_get_rowid_hosts (host)
+                    else:
+                        host_rowid = sqlh.insert_or_get_rowid_hosts (None, host)
+
+                    # def insert_or_update_instance (self, row_id_system: int, row_id_host: int, type: str, port: int, sysnr: int):
+                    sqlh.insert_or_update_instance (system_rowid, host_rowid, INSTANCE_TYPE_DIALOG, port, port % 100)
+
+                sqlh.closeconnection (b_commit)
+
+            
